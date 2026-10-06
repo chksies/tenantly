@@ -12,6 +12,7 @@ declare module 'fastify' {
 
 /** Verifies the bearer JWT. Does not check permissions. */
 export async function authenticate(req: FastifyRequest): Promise<AuthContext> {
+  if (req.auth) return req.auth; // already verified earlier in this request (by the rate-limit hook)
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) throw new AppError(401, 'unauthorized', 'Missing bearer token');
   try {

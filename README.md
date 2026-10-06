@@ -11,8 +11,9 @@ A multi-tenant SaaS backend built from scratch in TypeScript. Tenant isolation i
 | **Authorization** | Role-based access control (owner / admin / member / viewer), re-checked against the database on every request, with privilege-escalation guards |
 | **Billing** | Stripe Checkout + customer portal, signature-verified webhooks, idempotent and out-of-order safe, plan limits enforced server-side |
 | **Audit logging** | Append-only log written by DB triggers (can't be forgotten by app code) plus application events; immutable even to the table owner |
+| **Rate limiting** | Per-tenant, tiered by plan (free / pro / enterprise), Redis sliding-window log in an atomic Lua script, `429` + `Retry-After` + `RateLimit-*` headers, fails open |
 
-**Stack:** Node 22, TypeScript, Fastify 5, PostgreSQL 16, `pg`, `jose`, `zod`, Stripe SDK, Vitest.
+**Stack:** Node 22, TypeScript, Fastify 5, PostgreSQL 16, Redis, `pg`, `ioredis`, `jose`, `zod`, Stripe SDK, Vitest.
 
 ---
 
@@ -68,6 +69,78 @@ Webhook handling (`src/modules/billing/webhook.ts`) is built for how Stripe real
 - **Entitlements from state, not events:** `active`, `trialing` and `past_due` (grace period) keep Pro; anything else drops to Free.
 - Plan limits (Free = 3 projects) are enforced in the API under a row lock on the tenant, so concurrent requests can't exceed them.
 
+## Rate limiting
+
+Every authenticated request counts against its **tenant's** budget, and the size of the budget depends on the tenant's plan:
+
+| Plan | Requests per minute | How a tenant gets it |
+|---|---:|---|
+| `free` | 60 | default |
+| `pro` | 600 | Stripe subscription |
+| `enterprise` | 6,000 | set by hand (below) |
+
+Limits live in `src/plans.ts` next to the project caps. The budget is per tenant, not per user or token, so adding seats or minting tokens doesn't buy more capacity. A noisy tenant is throttled; its neighbours never notice.
+
+```
+$ curl -i localhost:3000/projects -H "authorization: Bearer $TOKEN"
+HTTP/1.1 200 OK
+RateLimit-Limit: 60
+RateLimit-Remaining: 59
+RateLimit-Reset: 60
+RateLimit-Policy: 60;w=60
+
+... 60 requests later ...
+
+HTTP/1.1 429 Too Many Requests
+Retry-After: 23
+RateLimit-Limit: 60
+RateLimit-Remaining: 0
+RateLimit-Reset: 23
+RateLimit-Policy: 60;w=60
+
+{"error":{"code":"rate_limited","message":"Rate limit exceeded for this workspace (60 requests per 60s on the free plan). Retry in 23s.",
+ "details":{"plan":"free","limit":60,"windowSeconds":60,"retryAfterSeconds":23}}}
+```
+
+The headers follow the IETF `RateLimit` header-fields draft and are sent on every limited response, not only 429s, so clients can pace themselves. `RateLimit-Reset` and `Retry-After` are *delta seconds* (rounded up, never 0), so client clock skew can't break them. The 429 body uses the same `{ error: { code, message, details } }` shape as every other error.
+
+**Assigning enterprise.** It isn't sold through Checkout. Run this as the table owner (the runtime role can't change plans) and it takes effect within `RATE_LIMIT_PLAN_CACHE_SECONDS`. Stripe subscription events never overwrite it:
+
+```sql
+UPDATE tenants SET plan = 'enterprise' WHERE slug = 'acme';
+```
+
+### How it works
+
+`src/ratelimit/` has three small pieces: `store.ts` (the Redis algorithm), `limiter.ts` (tenant → plan → limit), and `hook.ts` (the Fastify hook and the HTTP semantics).
+
+**Algorithm: sliding-window log in Lua.** Each allowed request is a member of a Redis sorted set scored by its timestamp. One script trims entries older than the window, counts what's left, and adds the new request only if there is room:
+
+```lua
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
+if redis.call('ZCARD', key) < limit then redis.call('ZADD', key, now, member) ... end
+```
+
+- **Exact, with no boundary burst.** A fixed-window counter lets a client send `limit` requests at 0:59 and `limit` more at 1:01. A sliding window can't: at most `limit` requests in *any* trailing 60 seconds.
+- **Atomic.** Check-then-insert as separate commands would let two API servers both see `limit - 1` and both admit a request. Redis runs a script to completion before serving anyone else, so it can't happen (test: 200 concurrent hits from two clients, limit 25, exactly 25 admitted).
+- **Redis's clock, not the app server's.** The script reads `TIME`, so skewed API nodes can't disagree about where the window starts. This needs Redis 5+.
+- **Denied requests aren't recorded.** Memory per tenant is bounded by its limit, and a client hammering while throttled doesn't extend its own penalty: it recovers when its oldest allowed request ages out.
+- **Idle tenants cost nothing.** Each key has a `PEXPIRE` of one window.
+- **Cluster-safe keys.** `rl:{tenantId}:requests`: the braces are a hash tag, so everything for one tenant stays in one slot.
+
+**Where it sits in the request.** A global `onRequest` hook verifies the JWT signature (stateless, no I/O), then asks Redis. A throttled tenant therefore costs one Redis round-trip and never a Postgres connection, which matters because the per-request role check in `requirePermission` is a database query. The verified token is reused by `authenticate()`, so the signature isn't checked twice. Requests with no valid token pass through: they can't be attributed to a tenant, protected routes reject them with a 401 anyway, and login/register keep their separate per-IP limiter. `/healthz` and the Stripe webhook are exempt, so a load balancer or Stripe is never throttled by tenant traffic.
+
+**Finding the plan without a query per request.** The limiter needs the tenant's plan, but a rate limiter that costs a database round-trip per request adds the load it exists to shed. Plans are cached in-process for `RATE_LIMIT_PLAN_CACHE_SECONDS` (default 10), concurrent misses share one query, failures are never cached, and the cache is size-capped. The trade-off is that a plan change reaches each node within that window, which is fine for a quota.
+
+**Failure mode: fail open.** If Redis is down, slow, or errors, the request is admitted and a warning is logged. Rate limiting protects the service, so it mustn't be able to take the service down. To make that hold in practice the Redis client has no offline queue, a 100 ms command timeout (`RATE_LIMIT_REDIS_TIMEOUT_MS`), and background reconnection with backoff, and the app starts (limiting off) even if Redis isn't up yet. The cost is that during a Redis outage there is no limit, so alert on those warnings. In production `REDIS_URL` is required, so a missing config is a startup error rather than a silently unprotected API. In development, leaving it unset turns the limiter off.
+
+### Trade-offs I considered
+
+- **Sliding-window log vs. sliding-window counter.** The log is exact but stores one entry per allowed request (bounded by the plan limit: at most 6,000 small entries for an enterprise tenant). The counter approximates by weighting the previous fixed window and stores two integers per tenant, so it scales to far larger limits. At these limits the exact answer is cheap, so I chose it; at 100k requests per window per tenant I'd switch.
+- **Token bucket** allows controlled bursts and is the usual choice when you want that. Here the plans are quotas ("N per minute"), so a window matches what customers are told and what the headers report.
+- **Fail open vs. fail closed.** Failing closed turns a cache outage into a full API outage. For abuse protection that's the wrong trade; for something like login-attempt throttling, where the limit is a security control, I'd consider the opposite.
+- **Not covered yet:** per-endpoint costs (e.g. a stricter budget for expensive routes, which the hash-tagged key layout already allows), burst limits on top of the minute quota, and plan-cache invalidation across nodes (currently TTL-only).
+
 ## Audit logging
 
 - Row changes on `projects` and `memberships` are captured by **database triggers** (actor, before/after JSON, IP), so they're logged even if application code forgets.
@@ -95,7 +168,9 @@ Webhook handling (`src/modules/billing/webhook.ts`) is built for how Stripe real
 | `POST /billing/checkout` · `POST /billing/portal` | `billing:manage` | Owner only |
 | `POST /webhooks/stripe` | Stripe signature | |
 | `GET /audit-logs` | `audit:read` | |
-| `GET /healthz` | public | |
+| `GET /healthz` | public | Not rate limited |
+
+All authenticated routes are subject to the per-tenant rate limit (see above).
 
 **Permission matrix**
 
@@ -111,12 +186,12 @@ Admins can only manage members and viewers. Only owners can create admins or own
 
 ## Running it
 
-Requires Node 22+ and Docker (or any Postgres 16).
+Requires Node 22+ and Docker (or any Postgres 16, plus Redis 5+ for rate limiting).
 
 ```bash
 git clone https://github.com/chksies/tenantly && cd tenantly
 cp .env.example .env            # then set JWT_SECRET and Stripe keys
-docker compose up -d db         # creates the DB and the two runtime roles
+docker compose up -d db redis   # creates the DB and the two runtime roles, and starts Redis
 npm ci
 npm run migrate
 npm run dev
@@ -140,13 +215,14 @@ curl -s localhost:3000/projects -H "authorization: Bearer $TOKEN"
 npm test          # needs Postgres; see TEST_DATABASE_URL in test/env.ts
 ```
 
-83 integration tests run against a real PostgreSQL, not mocks. The suite creates the roles, resets the schema and applies migrations itself. Highlights:
+113 tests (104 without Redis; 9 need `TEST_REDIS_URL`) run against a real PostgreSQL, not mocks. The suite creates the roles, resets the schema and applies migrations itself. Highlights:
 
 - **RLS tested directly in SQL, bypassing the API:** cross-tenant reads, writes and deletes, `WITH CHECK` violations, fail-closed behavior, no context leakage across pooled connections, blocked access to `password_hash` and internal tables.
 - **Audit immutability** even for the superuser, and trigger-captured before/after state.
 - **Auth attacks:** tampered, expired, wrong-key and `alg: none` JWTs; refresh-token replay; OAuth state replay/forgery and PKCE verifier/challenge matching.
 - **RBAC:** the full permission matrix, escalation attempts, demotion/removal taking effect on an unexpired token, cross-tenant access by ID.
 - **Billing:** bad/missing/tampered signatures, duplicate and *concurrent* redeliveries, out-of-order events, rollback-on-failure, and a concurrent-request race on the plan limit.
+- **Rate limiting:** limits and headers per plan, the exact 429 response, sliding-window behaviour, tenant isolation, shared budget across members, exemptions, fail-open, enterprise not downgraded by Stripe, and the plan cache. The Lua script runs against a **real Redis** (`TEST_REDIS_URL=redis://localhost:6379 npm test`; CI always sets it, otherwise those tests are skipped): exact limit under 200 concurrent requests from two clients, window sliding, denied requests not recorded, key expiry, recovery after `SCRIPT FLUSH`, and an unreachable Redis failing open.
 
 I verified the tests actually bite: removing the RLS policy on `projects` fails 6 tests, and removing the tenant row lock fails the plan-limit race test.
 
@@ -162,6 +238,7 @@ src/
   auth.ts              authenticate(), requirePermission(), tenantTx()
   rbac.ts              Roles, permissions, escalation rules
   security/            scrypt password hashing, JWT + opaque token helpers
+  ratelimit/           per-tenant limiter: Redis Lua store, plan-aware limiter, Fastify hook
   modules/
     auth/              register, login, refresh, OAuth2 + PKCE
     tenants/           tenant, members, invitations
@@ -176,7 +253,7 @@ test/                  Integration tests (Vitest + real Postgres)
 - **Two pools, not one.** Cross-tenant flows need `BYPASSRLS`; keeping them on a separate credential with a tiny surface (`withSystem`) means a bug in a normal handler can't reach across tenants.
 - **Role re-check costs one indexed query per request.** I chose immediate revocation over stateless speed; a short-TTL cache would be the next optimization.
 - **Invitation emails are stubbed** (`src/mailer.ts`). The raw token is only echoed in the API response outside production, so it can't be intercepted by the inviter.
-- **Not built yet:** email verification and password reset, MFA, per-tenant rate limits, background job for expired-row cleanup, OpenAPI docs, and a `pg_partman`-style retention policy for `audit_logs`.
+- **Not built yet:** email verification and password reset, MFA, background job for expired-row cleanup, OpenAPI docs, and a `pg_partman`-style retention policy for `audit_logs`.
 
 ## License
 

@@ -14,5 +14,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+  redis:
+    # Backs per-tenant rate limiting. Needs Redis >= 5 (the limiter script reads TIME, then writes).
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 volumes:
   pgdata:

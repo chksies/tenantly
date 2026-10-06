@@ -46,8 +46,10 @@ async function applySubscription(db: Db, event: Stripe.Event) {
     [tenantId, sub.id, status, plan, item?.price?.id ?? null, periodEnd, sub.cancel_at_period_end ?? false, event.created]);
   if (upsert.rowCount === 0) return; // stale event, ignored
 
+  // 'enterprise' is assigned by hand and Stripe only knows free/pro, so a subscription event must never overwrite it.
   await db.query(
-    'UPDATE tenants SET plan = $2, stripe_customer_id = coalesce(stripe_customer_id, $3) WHERE id = $1', [tenantId, plan, customer]);
+    `UPDATE tenants SET plan = CASE WHEN plan = 'enterprise' THEN plan ELSE $2 END,
+       stripe_customer_id = coalesce(stripe_customer_id, $3) WHERE id = $1`, [tenantId, plan, customer]);
   await audit(db, {
     tenantId, action: `billing.${event.type.replace('customer.', '')}`, entityType: 'subscriptions', entityId: sub.id,
     metadata: { status, plan, eventId: event.id },
