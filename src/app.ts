@@ -80,7 +80,7 @@ export async function buildApp(opts: AppOptions = {}) {
     req.log.error({ err }, 'unhandled error');
     return reply.status(500).send({ error: { code: 'internal_error', message: 'Internal server error' } });
   });
-   // edit the tentaly database
+
   app.decorateRequest('auth', null);
   await app.register(helmet);
   await app.register(rateLimit, { global: false });
