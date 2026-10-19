@@ -91,7 +91,8 @@ export async function tenantRoutes(app: FastifyInstance) {
     });
 
   // ---------------------------------------------------------------- invitations
-  app.post('/tenants/current/invitations', { preHandler: requirePermission('members:manage') }, async (req, reply) => {
+  // Emails a third party on the caller's behalf, so the caller's own address must be verified first.
+  app.post('/tenants/current/invitations', { preHandler: requirePermission('members:manage', { verifiedEmail: true }) }, async (req, reply) => {
     const body = parse(inviteBody, req.body);
     if (!canManageRole(req.auth!.role, body.role)) throw new AppError(403, 'forbidden', 'You cannot invite someone with that role');
     const token = generateOpaqueToken();

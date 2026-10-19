@@ -27,8 +27,12 @@ export interface Session {
 export const bearer = (s: { accessToken: string }) => ({ authorization: `Bearer ${s.accessToken}` });
 export const uniqueEmail = (prefix = 'user') => `${prefix}-${randomUUID().slice(0, 8)}@example.com`;
 
-/** Registers a new user with a fresh workspace (the user is its owner). */
-export async function register(app: FastifyInstance, workspaceName = 'Acme'): Promise<Session> {
+/**
+ * Registers a new user with a fresh workspace (the user is its owner). Most tests aren't about email
+ * verification, so the address is marked verified straight away; pass `{ verified: false }` to
+ * keep it unverified (email-verification.test.ts exercises the real flow).
+ */
+export async function register(app: FastifyInstance, workspaceName = 'Acme', opts: { verified?: boolean } = {}): Promise<Session> {
   const email = uniqueEmail('owner');
   const res = await app.inject({
     method: 'POST', url: '/auth/register',
@@ -36,6 +40,7 @@ export async function register(app: FastifyInstance, workspaceName = 'Acme'): Pr
   });
   if (res.statusCode !== 201) throw new Error(`register failed: ${res.body}`);
   const body = res.json();
+  if (opts.verified !== false) await systemPool.query('UPDATE users SET email_verified = true WHERE id = $1', [body.user.id]);
   return { userId: body.user.id, tenantId: body.tenant.id, email, accessToken: body.accessToken, refreshToken: body.refreshToken };
 }
 

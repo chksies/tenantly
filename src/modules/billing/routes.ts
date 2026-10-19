@@ -35,7 +35,7 @@ export async function billingRoutes(app: FastifyInstance, opts: { stripe: Stripe
     });
   }
 
-  app.post('/billing/checkout', { preHandler: requirePermission('billing:manage') }, async (req) => {
+  app.post('/billing/checkout', { preHandler: requirePermission('billing:manage', { verifiedEmail: true }) }, async (req) => {
     const tenantId = req.auth!.tenantId;
     const customer = await ensureCustomer(req);
     const session = await stripe.checkout.sessions.create({

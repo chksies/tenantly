@@ -26,6 +26,39 @@ export async function issueTokens(
   return { accessToken, refreshToken, tokenType: 'Bearer', expiresIn: config.ACCESS_TOKEN_TTL_SECONDS };
 }
 
+/** Minimum gap between two verification emails for one account (stops the resend button being a spam cannon). */
+export const VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
+
+/**
+ * Issues a verification link for `email` and returns the raw token (only its hash is stored).
+ * Earlier unused links for the user are voided, so at most one is ever live, and expired rows of
+ * any user are swept as we go. Must run on the system pool.
+ */
+export async function createEmailVerification(db: Db, userId: string, email: string): Promise<string> {
+  const token = generateOpaqueToken();
+  await db.query('DELETE FROM email_verifications WHERE expires_at < now() OR (user_id = $1 AND used_at IS NULL)', [userId]);
+  await db.query(
+    `INSERT INTO email_verifications (user_id, email, token_hash, expires_at)
+     VALUES ($1, $2, $3, now() + make_interval(hours => $4))`,
+    [userId, email, hashToken(token), config.EMAIL_VERIFICATION_TTL_HOURS],
+  );
+  return token;
+}
+
+/**
+ * Hands an account over to whoever has just proved they own its address.
+ *
+ * Anyone can register an address they don't own, and until it is verified nothing says the password
+ * on the account belongs to the real owner. If the owner later proves the address another way (a
+ * provider-verified Google email), keeping that password would let whoever registered first keep a
+ * way in. So the password is dropped, every session is ended, and outstanding links are voided.
+ */
+export async function reclaimUnverifiedAccount(db: Db, userId: string) {
+  await db.query('UPDATE users SET email_verified = true, password_hash = NULL WHERE id = $1', [userId]);
+  await db.query('UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [userId]);
+  await db.query('DELETE FROM email_verifications WHERE user_id = $1 AND used_at IS NULL', [userId]);
+}
+
 const slugify = (s: string) =>
   s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'workspace';
 

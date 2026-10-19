@@ -27,16 +27,28 @@ export async function authenticate(req: FastifyRequest): Promise<AuthContext> {
  * Route guard: authenticates, then re-reads the caller's role from the database (inside the
  * tenant's RLS scope) so removed or demoted members lose access immediately instead of when
  * their access token expires.
+ *
+ * `verifiedEmail: true` additionally requires the caller to have verified their email address.
+ * Use it for actions that can be abused from a throwaway signup (emailing third parties, paying).
+ * It is read from the database each time, so verifying takes effect on the very next request
+ * instead of when the access token is refreshed.
  */
-export function requirePermission(permission: Permission) {
+export function requirePermission(permission: Permission, opts: { verifiedEmail?: boolean } = {}) {
   return async (req: FastifyRequest) => {
     const auth = await authenticate(req);
     const row = await withTenant(auth, async (db) =>
-      (await db.query('SELECT role FROM memberships WHERE user_id = $1', [auth.userId])).rows[0]);
+      (await db.query(
+        opts.verifiedEmail
+          ? 'SELECT m.role, u.email_verified FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.user_id = $1'
+          : 'SELECT role FROM memberships WHERE user_id = $1',
+        [auth.userId])).rows[0]);
     if (!row) throw new AppError(401, 'unauthorized', 'You are no longer a member of this workspace');
     auth.role = row.role;
     if (!can(auth.role, permission)) {
       throw new AppError(403, 'forbidden', `Missing permission: ${permission}`);
+    }
+    if (opts.verifiedEmail && !row.email_verified) {
+      throw new AppError(403, 'email_not_verified', 'Verify your email address to do this. Check your inbox, or request a new link.');
     }
   };
 }

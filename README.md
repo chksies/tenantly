@@ -7,7 +7,7 @@ A multi-tenant SaaS backend built from scratch in TypeScript. Tenant isolation i
 | Concern | What's implemented |
 |---|---|
 | **Tenant isolation** | Postgres RLS on every tenant-owned table, `FORCE`d, fail-closed, with a non-privileged runtime role |
-| **Authentication** | Email/password (scrypt), short-lived JWT access tokens, rotating refresh tokens with reuse detection, OAuth2 authorization-code + PKCE (Google) |
+| **Authentication** | Email/password (scrypt), short-lived JWT access tokens, rotating refresh tokens with reuse detection, OAuth2 authorization-code + PKCE (Google), email verification |
 | **Authorization** | Role-based access control (owner / admin / member / viewer), re-checked against the database on every request, with privilege-escalation guards |
 | **Billing** | Stripe Checkout + customer portal, signature-verified webhooks, idempotent and out-of-order safe, plan limits enforced server-side |
 | **Audit logging** | Append-only log written by DB triggers (can't be forgotten by app code) plus application events; immutable even to the table owner |
@@ -47,7 +47,7 @@ Consequences worth noting:
 - **Fail closed.** If the context is missing, `app_tenant_id()` is `NULL`, the predicate is never true, and queries return zero rows instead of everyone's data.
 - **Handlers don't filter by tenant at all** (see `src/modules/projects/routes.ts`). A forgotten `WHERE` can't leak data because that isn't what enforces isolation.
 - **`WITH CHECK`** stops a tenant inserting or moving rows into someone else's tenant.
-- **Least privilege.** `saas_app` has no access to `refresh_tokens`, `oauth_*`, or `stripe_events`, cannot read `users.password_hash`, and cannot change its own plan or write subscriptions.
+- **Least privilege.** `saas_app` has no access to `refresh_tokens`, `email_verifications`, `oauth_*`, or `stripe_events`, cannot read `users.password_hash`, and cannot change its own plan or write subscriptions.
 - **Cross-tenant IDs return 404, not 403**, so IDs can't be probed for existence.
 
 ## Authentication & sessions
@@ -57,7 +57,28 @@ Consequences worth noting:
 - **Refresh tokens:** opaque, stored only as SHA-256 hashes, rotated on every use. Each belongs to a *family*; replaying an already-rotated token revokes the whole family and writes an `auth.refresh_reuse_detected` audit event.
 - **Roles aren't trusted from the JWT.** `requirePermission()` re-reads the caller's role from `memberships` inside the tenant's RLS scope on every request, so a removed or demoted member loses access immediately instead of when their token expires.
 - **OAuth2:** authorization-code flow with PKCE (S256). `state` and the code verifier are stored server-side, single-use, and expire after 10 minutes. Google ID tokens are verified against Google's JWKS (signature, issuer, audience, expiry). Sign-in requires a provider-verified email.
+- **Email verification:** sign-up emails a single-use link (24 h, configurable). Only its SHA-256 hash is stored, and the row records *which address* it proves, so a link sent to an old address can't verify a new one. See below.
 - **Multi-workspace:** a user can belong to many tenants; `POST /auth/switch-tenant` exchanges the session for one scoped to another workspace they belong to.
+
+### Email verification
+
+An account created with a password starts **unverified**. Accounts created through Google or by accepting an invitation start verified, because those already prove the address (a provider-verified email, or possession of the emailed invitation token).
+
+| | |
+|---|---|
+| `POST /auth/register` | Creates the account, emails a link, and returns `user.emailVerified: false`. Outside production the response also carries `verificationToken` so the flow can be tried without a mail server (the stub mailer only logs). |
+| `POST /auth/verify-email` `{ token }` | Redeems the link. Public, because the link may be opened on another device. |
+| `POST /auth/resend-verification` | Signed in. Sends a new link and voids the old one; at most one a minute per account (`429` with `Retry-After`). |
+| `GET /me`, `POST /auth/login` | Report whether the address is verified. |
+
+Design decisions:
+
+- **Unverified users can log in and use the product; two actions need a verified address**: inviting people (it emails third parties) and starting a Stripe checkout. This stops a throwaway signup being used as a spam relay without putting a wall in front of a new user. `requirePermission('...', { verifiedEmail: true })` enforces it, reading the flag from the database on each call, so verifying works on the very next request instead of when the 15-minute access token is refreshed. A missing permission is still reported first.
+- **The link is redeemed with a POST**, and the email points at the web app, not the API. Mail scanners and link previews fetch every URL in a message; if a GET consumed the token, they would burn it before the person clicked.
+- **Atomic and single use.** `UPDATE ... WHERE used_at IS NULL AND expires_at > now() RETURNING` claims the token, so of N concurrent redemptions exactly one wins (tested with 8).
+- **Resend can't be used as a spam cannon.** The user row is locked while the cooldown is checked, so concurrent clicks send one email, and the per-IP limiter applies on top.
+- **Closes an account pre-hijack.** Anyone can register someone else's address with a password. If the real owner later signs in with Google using that address, the accounts are linked, and without a fix the first registrant would keep a way in. When Google links to an *unverified* account, Tenantly drops the password, revokes every session, voids outstanding links, and writes an `auth.unverified_account_reclaimed` audit event. A verified password account keeps its password.
+- **Not built:** changing an email address. The `email` column on the link table is there so that, when it is built, old links can't verify a new address.
 
 ## Billing
 
@@ -155,17 +176,19 @@ if redis.call('ZCARD', key) < limit then redis.call('ZADD', key, now, member) ..
 | `POST /auth/register` | public | Creates user + workspace (owner) |
 | `POST /auth/login` | public | Optional `tenantId` |
 | `POST /auth/refresh` · `POST /auth/logout` | public | Rotation / family revocation |
+| `POST /auth/verify-email` | public | Redeem the emailed link (single use) |
+| `POST /auth/resend-verification` | authenticated | New link; one a minute |
 | `POST /auth/switch-tenant` | authenticated | New tokens for another workspace |
 | `GET /auth/oauth/:provider/start` · `.../callback` | public | OAuth2 + PKCE |
 | `GET /me` | authenticated | User + workspaces |
 | `GET/PATCH /tenants/current` | `tenant:read` / `tenant:update` | |
 | `GET /tenants/current/members` | `members:read` | |
 | `PATCH/DELETE /tenants/current/members/:userId` | `members:manage` | Escalation guards, last-owner protection |
-| `POST/GET/DELETE /tenants/current/invitations` | `members:manage` | 7-day single-use tokens |
+| `POST/GET/DELETE /tenants/current/invitations` | `members:manage` | 7-day single-use tokens; creating one needs a verified email |
 | `POST /invitations/accept` | public / authenticated | New or existing account |
 | `GET/POST/PATCH/DELETE /projects` | `projects:*` | Example tenant-owned resource, plan-limited |
 | `GET /billing` | `billing:read` | |
-| `POST /billing/checkout` · `POST /billing/portal` | `billing:manage` | Owner only |
+| `POST /billing/checkout` · `POST /billing/portal` | `billing:manage` | Owner only; checkout needs a verified email |
 | `POST /webhooks/stripe` | Stripe signature | |
 | `GET /audit-logs` | `audit:read` | |
 | `GET /healthz` | public | Not rate limited |
@@ -215,13 +238,14 @@ curl -s localhost:3000/projects -H "authorization: Bearer $TOKEN"
 npm test          # needs Postgres; see TEST_DATABASE_URL in test/env.ts
 ```
 
-113 tests (104 without Redis; 9 need `TEST_REDIS_URL`) run against a real PostgreSQL, not mocks. The suite creates the roles, resets the schema and applies migrations itself. Highlights:
+134 tests (125 without Redis; 9 need `TEST_REDIS_URL`) run against a real PostgreSQL, not mocks. The suite creates the roles, resets the schema and applies migrations itself. Highlights:
 
 - **RLS tested directly in SQL, bypassing the API:** cross-tenant reads, writes and deletes, `WITH CHECK` violations, fail-closed behavior, no context leakage across pooled connections, blocked access to `password_hash` and internal tables.
 - **Audit immutability** even for the superuser, and trigger-captured before/after state.
 - **Auth attacks:** tampered, expired, wrong-key and `alg: none` JWTs; refresh-token replay; OAuth state replay/forgery and PKCE verifier/challenge matching.
 - **RBAC:** the full permission matrix, escalation attempts, demotion/removal taking effect on an unexpired token, cross-tenant access by ID.
 - **Billing:** bad/missing/tampered signatures, duplicate and *concurrent* redeliveries, out-of-order events, rollback-on-failure, and a concurrent-request race on the plan limit.
+- **Email verification:** single use, expiry, forged and malformed tokens, a link tied to the address it was sent to, 8 concurrent redemptions (one wins), resend voiding the old link, the one-a-minute cooldown (including concurrent clicks), gating of invitations and checkout with the same access token working right after verifying, and the Google pre-hijack scenario (attacker's password, session and link all die; a verified account is untouched).
 - **Rate limiting:** limits and headers per plan, the exact 429 response, sliding-window behaviour, tenant isolation, shared budget across members, exemptions, fail-open, enterprise not downgraded by Stripe, and the plan cache. The Lua script runs against a **real Redis** (`TEST_REDIS_URL=redis://localhost:6379 npm test`; CI always sets it, otherwise those tests are skipped): exact limit under 200 concurrent requests from two clients, window sliding, denied requests not recorded, key expiry, recovery after `SCRIPT FLUSH`, and an unreachable Redis failing open.
 
 I verified the tests actually bite: removing the RLS policy on `projects` fails 6 tests, and removing the tenant row lock fails the plan-limit race test.
@@ -253,7 +277,7 @@ test/                  Integration tests (Vitest + real Postgres)
 - **Two pools, not one.** Cross-tenant flows need `BYPASSRLS`; keeping them on a separate credential with a tiny surface (`withSystem`) means a bug in a normal handler can't reach across tenants.
 - **Role re-check costs one indexed query per request.** I chose immediate revocation over stateless speed; a short-TTL cache would be the next optimization.
 - **Invitation emails are stubbed** (`src/mailer.ts`). The raw token is only echoed in the API response outside production, so it can't be intercepted by the inviter.
-- **Not built yet:** email verification and password reset, MFA, background job for expired-row cleanup, OpenAPI docs, and a `pg_partman`-style retention policy for `audit_logs`.
+- **Not built yet:** password reset (it would reuse the verification-link machinery), changing an email address, MFA, background job for expired-row cleanup, OpenAPI docs, and a `pg_partman`-style retention policy for `audit_logs`.
 
 ## License
 
